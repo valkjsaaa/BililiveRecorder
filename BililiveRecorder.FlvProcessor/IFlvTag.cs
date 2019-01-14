@@ -8,8 +8,12 @@ namespace BililiveRecorder.FlvProcessor
         int TagSize { get; set; }
         int TimeStamp { get; }
         byte[] StreamId { get; set; }
-        bool IsVideoKeyframe { get; }
         byte[] Data { get; set; }
+
+        bool IsVideoKeyframe { get; }
+        int Profile { get; }
+        int Level { get; }
+
 
         void SetTimeStamp(int timestamp);
         byte[] ToBytes(bool useDataSize, int offset = 0);

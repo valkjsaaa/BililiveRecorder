@@ -239,6 +239,37 @@ namespace BililiveRecorder.Core
                     Processor.ClipLengthPast = _config.ClipLengthPast;
                     Processor.CuttingNumber = _config.CuttingNumber;
 
+                    Processor.TagProcessed += (sender, e) =>
+                    {
+                        if ((e.Tag.TagType == TagType.VIDEO) && ((e.Tag.Data[0] & 0x0F) == 0x07) && (e.Tag.Data[1] == 0x01))
+                        {
+                            var tag = e.Tag;
+
+                            uint head = 5;
+
+                            while (head < tag.TagSize - 5)
+                            {
+                                var array = new[] {
+                                    tag.Data[head++],
+                                    tag.Data[head++],
+                                    tag.Data[head++],
+                                    tag.Data[head++]
+                                };
+
+                                var size = BitConverter.ToUInt32(array.ToBE(), 0);
+
+                                int type = tag.Data[head] & 0b00011111;
+                                if (type == 12)
+                                {
+                                    Console.WriteLine(DateTime.Now.ToString() + " H264 " + type + " Size " + size);
+                                }
+                                head += size;
+                            }
+
+                            // Console.WriteLine("--------");
+                        }
+                    };
+
                     _stream = await _response.Content.ReadAsStreamAsync();
                     _stream.ReadTimeout = 3 * 1000;
 
