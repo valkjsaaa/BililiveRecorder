@@ -31,6 +31,7 @@ namespace BililiveRecorder.Cli
             {
                 new Option<string>(new []{ "--cookie", "-c" }, "Cookie string for api requests"),
                 new Option<string>("--live-api-host"),
+                new Option<string>("--webhook-url"),
                 new Option<string>(new[]{ "--filename-format", "-f" }, "File name format"),
                 new Argument<string>("output-path"),
                 new Argument<int[]>("room-ids")
@@ -96,8 +97,18 @@ namespace BililiveRecorder.Cli
                 config.Global.Cookie = opts.Cookie;
             if (!string.IsNullOrWhiteSpace(opts.LiveApiHost))
                 config.Global.LiveApiHost = opts.LiveApiHost;
+            if (!string.IsNullOrWhiteSpace(opts.WebhookUrl))
+                config.Global.WebHookUrlsV2 = opts.WebhookUrl;
             if (!string.IsNullOrWhiteSpace(opts.FilenameFormat))
                 config.Global.RecordFilenameFormat = opts.FilenameFormat;
+
+            config.Global.RecordDanmaku = true;
+            config.Global.RecordDanmakuGift = true;
+            config.Global.RecordDanmakuGuard = true;
+            config.Global.RecordDanmakuRaw = true;
+            config.Global.RecordDanmakuSuperChat = true;
+            config.Global.CuttingMode = CuttingMode.Disabled;
+            config.Global.RecordFilenameFormat = "{roomid}/{roomid}-{date}-{time}.flv";
 
             config.Global.WorkDirectory = opts.OutputPath;
             config.Rooms = opts.RoomIds.Select(x => new RoomConfig { RoomId = x, AutoRecord = true }).ToList();
@@ -146,6 +157,8 @@ namespace BililiveRecorder.Cli
             public string? Cookie { get; set; }
 
             public string? LiveApiHost { get; set; }
+            
+            public string? WebhookUrl { get; set; }
 
             public string? FilenameFormat { get; set; }
 
