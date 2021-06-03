@@ -40,6 +40,8 @@ namespace BililiveRecorder.Core.Recording
             };
             this.OnRecordFileOpening(this.fileOpeningEventArgs);
 
+            this.logger.Information("新建录制文件 {Path}", fullPath);
+
             var file = new FileStream(fullPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
 
             _ = Task.Run(async () => await this.WriteStreamToFileAsync(stream, file).ConfigureAwait(false));
@@ -100,8 +102,14 @@ namespace BililiveRecorder.Core.Recording
                     this.logger.Warning(ex, "Error calling OnRecordFileClosed");
                 }
 
-                file.Dispose();
-                stream.Dispose();
+                try
+                { file.Dispose(); }
+                catch (Exception ex)
+                { this.logger.Warning(ex, "关闭文件时发生错误"); }
+
+                try
+                { stream.Dispose(); }
+                catch (Exception) { }
 
                 this.OnRecordSessionEnded(EventArgs.Empty);
 

@@ -38,19 +38,33 @@ namespace BililiveRecorder.WPF
             levelSwitchConsole = new LoggingLevelSwitch(Serilog.Events.LogEventLevel.Error);
             logger = BuildLogger();
             AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
+            TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
             Log.Logger = logger;
             SentrySdk.ConfigureScope(s =>
             {
                 s.SetTag("fullsemver", GitVersionInformation.FullSemVer);
-                try
+            });
+            _ = SentrySdk.ConfigureScopeAsync(async s =>
+            {
+                var path = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(typeof(Program).Assembly.Location), "..", "packages", ".betaId"));
+                for (var i = 0; i < 10; i++)
                 {
-                    var path = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(typeof(Program).Assembly.Location), "..", "packages", ".betaId"));
-                    if (!File.Exists(path)) return;
-                    var content = File.ReadAllText(path);
-                    if (Guid.TryParse(content, out var id))
-                        s.User = new User { Id = id.ToString() };
+                    if (i != 0)
+                        await Task.Delay(TimeSpan.FromSeconds(5));
+                    try
+                    {
+                        if (!File.Exists(path))
+                            continue;
+                        var content = File.ReadAllText(path);
+                        if (Guid.TryParse(content, out var id))
+                        {
+                            s.User.Id = id.ToString();
+                            return;
+                        }
+                    }
+                    catch (Exception)
+                    { }
                 }
-                catch (Exception) { }
             });
             update = new Update(logger);
         }
@@ -143,6 +157,14 @@ namespace BililiveRecorder.WPF
             .Enrich.WithThreadName()
             .Enrich.FromLogContext()
             .Enrich.WithExceptionDetails()
+            .Destructure.ByTransforming<Flv.Xml.XmlFlvFile.XmlFlvFileMeta>(x => new
+            {
+                x.Version,
+                x.ExportTime,
+                x.FileSize,
+                x.FileCreationTime,
+                x.FileModificationTime,
+            })
             .WriteTo.Console(levelSwitch: levelSwitchConsole)
 #if DEBUG
             .WriteTo.Debug()
@@ -153,9 +175,10 @@ namespace BililiveRecorder.WPF
             .WriteTo.File(new CompactJsonFormatter(), "./logs/bilirec.txt", shared: true, rollingInterval: RollingInterval.Day, rollOnFileSizeLimit: true)
             .WriteTo.Sentry(o =>
             {
-                o.Dsn = "https://7c6c5da3140543809661813aaa836207@o210546.ingest.sentry.io/5556540";
-
+                o.Dsn = "https://7e9cd012346f46f28b352195f7b6acc6@o210546.ingest.sentry.io/5556540";
+                o.SendDefaultPii = true;
                 o.DisableAppDomainUnhandledExceptionCapture();
+                o.DisableTaskUnobservedTaskExceptionCapture();
                 o.AddExceptionFilterForType<System.Net.Http.HttpRequestException>();
 
                 o.MinimumBreadcrumbLevel = Serilog.Events.LogEventLevel.Debug;
@@ -176,11 +199,15 @@ namespace BililiveRecorder.WPF
         private static void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
         {
             if (e.ExceptionObject is Exception ex)
-                logger.Fatal(ex, "Unhandled exception from Application.UnhandledException");
+                logger.Fatal(ex, "Unhandled exception from AppDomain.UnhandledException");
         }
 
         [HandleProcessCorruptedStateExceptions, SecurityCritical]
+        private static void TaskScheduler_UnobservedTaskException(object sender, UnobservedTaskExceptionEventArgs e) =>
+            logger.Error(e.Exception, "Unobserved exception from TaskScheduler.UnobservedTaskException");
+
+        [HandleProcessCorruptedStateExceptions, SecurityCritical]
         private static void App_DispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e) =>
-            logger.Fatal(e.Exception, "Unhandled exception from AppDomain.DispatcherUnhandledException");
+            logger.Fatal(e.Exception, "Unhandled exception from Application.DispatcherUnhandledException");
     }
 }

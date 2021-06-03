@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Compression;
 using System.IO.Pipelines;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using BililiveRecorder.Flv;
 using BililiveRecorder.Flv.Grouping;
@@ -51,13 +52,15 @@ namespace BililiveRecorder.ToolBox.Commands
     {
         private static readonly ILogger logger = Log.ForContext<FixHandler>();
 
-        public Task<CommandResponse<FixResponse>> Handle(FixRequest request) => this.Handle(request, null);
+        public Task<CommandResponse<FixResponse>> Handle(FixRequest request) => this.Handle(request, default, null);
 
-        public async Task<CommandResponse<FixResponse>> Handle(FixRequest request, Func<double, Task>? progress)
+        public async Task<CommandResponse<FixResponse>> Handle(FixRequest request, CancellationToken cancellationToken, Func<double, Task>? progress)
         {
             FileStream? flvFileStream = null;
             try
             {
+                XmlFlvFile.XmlFlvFileMeta? meta = null;
+
                 var memoryStreamProvider = new RecyclableMemoryStreamProvider();
                 var comments = new List<ProcessingComment>();
                 var context = new FlvProcessingContext();
@@ -77,6 +80,7 @@ namespace BililiveRecorder.ToolBox.Commands
                         {
                             using var stream = new GZipStream(File.Open(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read), CompressionMode.Decompress);
                             var xmlFlvFile = (XmlFlvFile)XmlFlvFile.Serializer.Deserialize(stream);
+                            meta = xmlFlvFile.Meta;
                             return new FlvTagListReader(xmlFlvFile.Tags);
                         });
                     }
@@ -87,6 +91,7 @@ namespace BililiveRecorder.ToolBox.Commands
                         {
                             using var stream = File.Open(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read);
                             var xmlFlvFile = (XmlFlvFile)XmlFlvFile.Serializer.Deserialize(stream);
+                            meta = xmlFlvFile.Meta;
                             return new FlvTagListReader(xmlFlvFile.Tags);
                         });
                     }
@@ -122,7 +127,7 @@ namespace BililiveRecorder.ToolBox.Commands
 
                 // Pipeline
                 using var grouping = new TagGroupReader(tagReader);
-                using var writer = new FlvProcessingContextWriter(tagWriter: tagWriter, allowMissingHeader: true);
+                using var writer = new FlvProcessingContextWriter(tagWriter: tagWriter, allowMissingHeader: true, disableKeyframes: false);
                 var statsRule = new StatsRule();
                 var pipeline = new ProcessingPipelineBuilder(new ServiceCollection().BuildServiceProvider()).Add(statsRule).AddDefault().AddRemoveFillerData().Build();
 
@@ -130,9 +135,9 @@ namespace BililiveRecorder.ToolBox.Commands
                 await Task.Run(async () =>
                 {
                     var count = 0;
-                    while (true)
+                    while (!cancellationToken.IsCancellationRequested)
                     {
-                        var group = await grouping.ReadGroupAsync(default).ConfigureAwait(false);
+                        var group = await grouping.ReadGroupAsync(cancellationToken).ConfigureAwait(false);
                         if (group is null)
                             break;
 
@@ -157,7 +162,13 @@ namespace BililiveRecorder.ToolBox.Commands
                     }
                 }).ConfigureAwait(false);
 
+                if (cancellationToken.IsCancellationRequested)
+                    return new CommandResponse<FixResponse> { Status = ResponseStatus.Cancelled };
+
                 // Post Run
+                if (meta is not null)
+                    logger.Information("Xml meta: {@Meta}", meta);
+
                 if (xmlMode)
                 {
                     await Task.Run(() =>
@@ -166,7 +177,7 @@ namespace BililiveRecorder.ToolBox.Commands
 
                         for (var i = 0; i < w.Files.Count; i++)
                         {
-                            var path = Path.ChangeExtension(request.OutputBase, $"fix_p{i + 1}.brec.xml");
+                            var path = Path.ChangeExtension(request.OutputBase, $"fix_p{i + 1:D3}.brec.xml");
                             outputPaths.Add(path);
                             using var file = new StreamWriter(File.Create(path));
                             XmlFlvFile.Serializer.Serialize(file, new XmlFlvFile { Tags = w.Files[i] });
@@ -185,6 +196,9 @@ namespace BililiveRecorder.ToolBox.Commands
                         }
                     });
                 }
+
+                if (cancellationToken.IsCancellationRequested)
+                    return new CommandResponse<FixResponse> { Status = ResponseStatus.Cancelled };
 
                 // Result
                 var response = await Task.Run(() =>
@@ -214,6 +228,10 @@ namespace BililiveRecorder.ToolBox.Commands
                 });
 
                 return new CommandResponse<FixResponse> { Status = ResponseStatus.OK, Result = response };
+            }
+            catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return new CommandResponse<FixResponse> { Status = ResponseStatus.Cancelled };
             }
             catch (NotFlvFileException ex)
             {
@@ -294,16 +312,16 @@ namespace BililiveRecorder.ToolBox.Commands
             public Stream CreateAlternativeHeaderStream()
             {
                 var path = Path.ChangeExtension(this.pathTemplate, "header.txt");
-                return File.Open(path, FileMode.Append, FileAccess.Write, FileShare.None);
+                return new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
             }
 
-            public (Stream stream, object state) CreateOutputStream()
+            public (Stream stream, object? state) CreateOutputStream()
             {
                 var i = this.fileIndex++;
-                var path = Path.ChangeExtension(this.pathTemplate, $"fix_p{i}.flv");
+                var path = Path.ChangeExtension(this.pathTemplate, $"fix_p{i:D3}.flv");
                 var fileStream = File.Open(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
                 BeforeFileOpen?.Invoke(this, path);
-                return (fileStream, null!);
+                return (fileStream, null);
             }
         }
     }

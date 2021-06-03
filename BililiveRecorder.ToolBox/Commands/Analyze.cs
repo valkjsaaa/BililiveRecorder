@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Compression;
 using System.IO.Pipelines;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using BililiveRecorder.Flv;
 using BililiveRecorder.Flv.Amf;
@@ -48,13 +49,15 @@ namespace BililiveRecorder.ToolBox.Commands
     {
         private static readonly ILogger logger = Log.ForContext<AnalyzeHandler>();
 
-        public Task<CommandResponse<AnalyzeResponse>> Handle(AnalyzeRequest request) => this.Handle(request, null);
+        public Task<CommandResponse<AnalyzeResponse>> Handle(AnalyzeRequest request) => this.Handle(request, default, null);
 
-        public async Task<CommandResponse<AnalyzeResponse>> Handle(AnalyzeRequest request, Func<double, Task>? progress)
+        public async Task<CommandResponse<AnalyzeResponse>> Handle(AnalyzeRequest request, CancellationToken cancellationToken, Func<double, Task>? progress)
         {
             FileStream? flvFileStream = null;
             try
             {
+                XmlFlvFile.XmlFlvFileMeta? meta = null;
+
                 var memoryStreamProvider = new RecyclableMemoryStreamProvider();
                 var comments = new List<ProcessingComment>();
                 var context = new FlvProcessingContext();
@@ -71,6 +74,7 @@ namespace BililiveRecorder.ToolBox.Commands
                         {
                             using var stream = new GZipStream(File.Open(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read), CompressionMode.Decompress);
                             var xmlFlvFile = (XmlFlvFile)XmlFlvFile.Serializer.Deserialize(stream);
+                            meta = xmlFlvFile.Meta;
                             return new FlvTagListReader(xmlFlvFile.Tags);
                         });
                     else if (inputPath.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
@@ -78,6 +82,7 @@ namespace BililiveRecorder.ToolBox.Commands
                         {
                             using var stream = File.Open(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read);
                             var xmlFlvFile = (XmlFlvFile)XmlFlvFile.Serializer.Deserialize(stream);
+                            meta = xmlFlvFile.Meta;
                             return new FlvTagListReader(xmlFlvFile.Tags);
                         });
                     else
@@ -101,7 +106,7 @@ namespace BililiveRecorder.ToolBox.Commands
 
                 // Pipeline
                 using var grouping = new TagGroupReader(tagReader);
-                using var writer = new FlvProcessingContextWriter(tagWriter: tagWriter, allowMissingHeader: true);
+                using var writer = new FlvProcessingContextWriter(tagWriter: tagWriter, allowMissingHeader: true, disableKeyframes: true);
                 var statsRule = new StatsRule();
                 var pipeline = new ProcessingPipelineBuilder(new ServiceCollection().BuildServiceProvider()).Add(statsRule).AddDefault().AddRemoveFillerData().Build();
 
@@ -109,9 +114,9 @@ namespace BililiveRecorder.ToolBox.Commands
                 await Task.Run(async () =>
                 {
                     var count = 0;
-                    while (true)
+                    while (!cancellationToken.IsCancellationRequested)
                     {
-                        var group = await grouping.ReadGroupAsync(default).ConfigureAwait(false);
+                        var group = await grouping.ReadGroupAsync(cancellationToken).ConfigureAwait(false);
                         if (group is null)
                             break;
 
@@ -135,6 +140,12 @@ namespace BililiveRecorder.ToolBox.Commands
                             await progress((double)flvFileStream.Position / flvFileStream.Length);
                     }
                 }).ConfigureAwait(false);
+
+                if (cancellationToken.IsCancellationRequested)
+                    return new CommandResponse<AnalyzeResponse> { Status = ResponseStatus.Cancelled };
+
+                if (meta is not null)
+                    logger.Information("Xml meta: {@Meta}", meta);
 
                 // Result
                 var response = await Task.Run(() =>
@@ -168,6 +179,10 @@ namespace BililiveRecorder.ToolBox.Commands
                     Status = ResponseStatus.OK,
                     Result = response
                 };
+            }
+            catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return new CommandResponse<AnalyzeResponse> { Status = ResponseStatus.Cancelled };
             }
             catch (NotFlvFileException ex)
             {

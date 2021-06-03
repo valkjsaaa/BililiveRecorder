@@ -12,6 +12,7 @@ namespace BililiveRecorder.Flv.Writer
         private readonly SemaphoreSlim semaphoreSlim = new SemaphoreSlim(1, 1);
         private readonly IFlvTagWriter tagWriter;
         private readonly bool allowMissingHeader;
+        private readonly bool disableKeyframes;
         private bool disposedValue;
 
         private WriterState state = WriterState.EmptyFileOrNotOpen;
@@ -21,6 +22,7 @@ namespace BililiveRecorder.Flv.Writer
         private Tag? nextVideoHeaderTag = null;
 
         private ScriptTagBody? lastScriptBody = null;
+        private KeyframesScriptDataValue? keyframesScriptDataValue = null;
         private double lastDuration;
 
         public event EventHandler<FileClosedEventArgs>? FileClosed;
@@ -28,13 +30,11 @@ namespace BililiveRecorder.Flv.Writer
         public Action<ScriptTagBody>? BeforeScriptTagWrite { get; set; }
         public Action<ScriptTagBody>? BeforeScriptTagRewrite { get; set; }
 
-        public FlvProcessingContextWriter(IFlvTagWriter tagWriter) : this(tagWriter: tagWriter, allowMissingHeader: false)
-        { }
-
-        public FlvProcessingContextWriter(IFlvTagWriter tagWriter, bool allowMissingHeader)
+        public FlvProcessingContextWriter(IFlvTagWriter tagWriter, bool allowMissingHeader, bool disableKeyframes)
         {
             this.tagWriter = tagWriter ?? throw new ArgumentNullException(nameof(tagWriter));
             this.allowMissingHeader = allowMissingHeader;
+            this.disableKeyframes = disableKeyframes;
         }
 
         public async Task WriteAsync(FlvProcessingContext context)
@@ -138,16 +138,7 @@ namespace BililiveRecorder.Flv.Writer
             }
         }
 
-        private async Task OpenNewFileImpl()
-        {
-            this.CloseCurrentFileImpl();
-
-            await this.tagWriter.CreateNewFile().ConfigureAwait(false);
-
-            this.state = WriterState.BeforeScript;
-        }
-
-        private async Task RewriteScriptTagImpl(double duration)
+        private async Task RewriteScriptTagImpl(double duration, bool updateKeyframes, double keyframeTime, double filePosition)
         {
             if (this.lastScriptBody is null)
                 return;
@@ -156,35 +147,59 @@ namespace BililiveRecorder.Flv.Writer
             if (value is not null)
                 value["duration"] = (ScriptDataNumber)duration;
 
+            if (updateKeyframes && this.keyframesScriptDataValue is not null)
+                this.keyframesScriptDataValue.AddData(time_in_ms: keyframeTime, filePosition: filePosition);
+
             this.BeforeScriptTagRewrite?.Invoke(this.lastScriptBody);
 
             await this.tagWriter.OverwriteMetadata(this.lastScriptBody).ConfigureAwait(false);
         }
 
-        private async Task WriteScriptTagImpl()
+        private async Task OpenNewFileThenWriteHeadersImpl()
         {
+            this.CloseCurrentFileImpl();
+
             if (this.nextScriptTag is null)
                 throw new InvalidOperationException("No script tag availible");
 
             if (this.nextScriptTag.ScriptData is null)
                 throw new InvalidOperationException("ScriptData is null");
 
-            this.lastScriptBody = this.nextScriptTag.ScriptData;
+            if (!this.allowMissingHeader)
+            {
+                if (this.nextVideoHeaderTag is null)
+                    throw new InvalidOperationException("No video header tag availible");
 
-            var value = this.lastScriptBody.GetMetadataValue();
-            if (value is not null)
-                value["duration"] = (ScriptDataNumber)0;
+                if (this.nextAudioHeaderTag is null)
+                    throw new InvalidOperationException("No audio header tag availible");
+            }
 
-            this.BeforeScriptTagWrite?.Invoke(this.lastScriptBody);
+            // Open File
+            await this.tagWriter.CreateNewFile().ConfigureAwait(false);
 
-            await this.tagWriter.WriteTag(this.nextScriptTag).ConfigureAwait(false);
+            // Write Script Tag
+            {
+                this.lastScriptBody = this.nextScriptTag.ScriptData;
 
-            this.state = WriterState.BeforeHeader;
-        }
+                var value = this.lastScriptBody.GetMetadataValue();
+                if (value is not null)
+                {
+                    value["duration"] = (ScriptDataNumber)0;
 
-        private async Task WriteHeaderTagsImpl()
-        {
-            if (this.allowMissingHeader)
+                    if (!this.disableKeyframes)
+                    {
+                        var kfv = new KeyframesScriptDataValue();
+                        value["keyframes"] = kfv;
+                        this.keyframesScriptDataValue = kfv;
+                    }
+                }
+
+                this.BeforeScriptTagWrite?.Invoke(this.lastScriptBody);
+
+                await this.tagWriter.WriteTag(this.nextScriptTag).ConfigureAwait(false);
+            }
+
+            // Write Header Tag
             {
                 if (this.nextVideoHeaderTag is not null)
                     await this.tagWriter.WriteTag(this.nextVideoHeaderTag).ConfigureAwait(false);
@@ -192,17 +207,7 @@ namespace BililiveRecorder.Flv.Writer
                 if (this.nextAudioHeaderTag is not null)
                     await this.tagWriter.WriteTag(this.nextAudioHeaderTag).ConfigureAwait(false);
             }
-            else
-            {
-                if (this.nextVideoHeaderTag is null)
-                    throw new InvalidOperationException("No video header tag availible");
 
-                if (this.nextAudioHeaderTag is null)
-                    throw new InvalidOperationException("No audio header tag availible");
-
-                await this.tagWriter.WriteTag(this.nextVideoHeaderTag).ConfigureAwait(false);
-                await this.tagWriter.WriteTag(this.nextAudioHeaderTag).ConfigureAwait(false);
-            }
             this.state = WriterState.Writing;
         }
 
@@ -211,16 +216,7 @@ namespace BililiveRecorder.Flv.Writer
             switch (this.state)
             {
                 case WriterState.EmptyFileOrNotOpen:
-                    await this.OpenNewFileImpl().ConfigureAwait(false);
-                    await this.WriteScriptTagImpl().ConfigureAwait(false);
-                    await this.WriteHeaderTagsImpl().ConfigureAwait(false);
-                    break;
-                case WriterState.BeforeScript:
-                    await this.WriteScriptTagImpl().ConfigureAwait(false);
-                    await this.WriteHeaderTagsImpl().ConfigureAwait(false);
-                    break;
-                case WriterState.BeforeHeader:
-                    await this.WriteHeaderTagsImpl().ConfigureAwait(false);
+                    await this.OpenNewFileThenWriteHeadersImpl().ConfigureAwait(false);
                     break;
                 case WriterState.Writing:
                     break;
@@ -228,12 +224,16 @@ namespace BililiveRecorder.Flv.Writer
                     throw new InvalidOperationException($"Can't write data tag with current state ({this.state})");
             }
 
-            foreach (var tag in dataAction.Tags)
+            var pos = this.tagWriter.FileSize;
+            var tags = dataAction.Tags;
+            var firstTag = tags[0];
+            var duration = tags[tags.Count - 1].Timestamp / 1000d;
+            this.lastDuration = duration;
+
+            foreach (var tag in tags)
                 await this.tagWriter.WriteTag(tag).ConfigureAwait(false);
 
-            var duration = dataAction.Tags[dataAction.Tags.Count - 1].Timestamp / 1000d;
-            this.lastDuration = duration;
-            await this.RewriteScriptTagImpl(duration).ConfigureAwait(false);
+            await this.RewriteScriptTagImpl(duration, firstTag.IsKeyframeData(), firstTag.Timestamp, pos).ConfigureAwait(false);
         }
 
         private async Task WriteEndTag(PipelineEndAction endAction)
@@ -241,16 +241,7 @@ namespace BililiveRecorder.Flv.Writer
             switch (this.state)
             {
                 case WriterState.EmptyFileOrNotOpen:
-                    await this.OpenNewFileImpl().ConfigureAwait(false);
-                    await this.WriteScriptTagImpl().ConfigureAwait(false);
-                    await this.WriteHeaderTagsImpl().ConfigureAwait(false);
-                    break;
-                case WriterState.BeforeScript:
-                    await this.WriteScriptTagImpl().ConfigureAwait(false);
-                    await this.WriteHeaderTagsImpl().ConfigureAwait(false);
-                    break;
-                case WriterState.BeforeHeader:
-                    await this.WriteHeaderTagsImpl().ConfigureAwait(false);
+                    await this.OpenNewFileThenWriteHeadersImpl().ConfigureAwait(false);
                     break;
                 case WriterState.Writing:
                     break;
@@ -271,7 +262,13 @@ namespace BililiveRecorder.Flv.Writer
                 if (disposing)
                 {
                     // dispose managed state (managed objects)
-                    this.CloseCurrentFileImpl();
+                    try
+                    {
+                        this.CloseCurrentFileImpl();
+                    }
+                    catch (Exception)
+                    { }
+
                     this.tagWriter.Dispose();
                 }
 

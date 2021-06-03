@@ -12,8 +12,10 @@ using BililiveRecorder.DependencyInjection;
 using BililiveRecorder.ToolBox;
 using Microsoft.Extensions.DependencyInjection;
 using Serilog;
+using Serilog.Core;
 using Serilog.Events;
 using Serilog.Exceptions;
+using Serilog.Formatting.Compact;
 
 namespace BililiveRecorder.Cli
 {
@@ -23,19 +25,24 @@ namespace BililiveRecorder.Cli
         {
             var cmd_run = new Command("run", "Run BililiveRecorder in standard mode")
             {
+                new Option<LogEventLevel>(new []{ "--loglevel", "--log", "-l" }, () => LogEventLevel.Information, "Minimal log level"),
                 new Argument<string>("path"),
             };
-            cmd_run.Handler = CommandHandler.Create<string>(RunConfigMode);
+            cmd_run.AddAlias("r");
+            cmd_run.Handler = CommandHandler.Create<string, LogEventLevel>(RunConfigMode);
 
             var cmd_portable = new Command("portable", "Run BililiveRecorder in config-less mode")
             {
+                new Option<LogEventLevel>(new []{ "--loglevel", "--log", "-l" }, () => LogEventLevel.Information, "Minimal log level"),
                 new Option<string>(new []{ "--cookie", "-c" }, "Cookie string for api requests"),
+                new Option<PortableModeArguments.PortableDanmakuMode>(new []{ "--danmaku", "-d" }, "Flags for danmaku recording"),
                 new Option<string>("--live-api-host"),
                 new Option<string>("--webhook-url"),
                 new Option<string>(new[]{ "--filename-format", "-f" }, "File name format"),
                 new Argument<string>("output-path"),
                 new Argument<int[]>("room-ids")
             };
+            cmd_portable.AddAlias("p");
             cmd_portable.Handler = CommandHandler.Create<PortableModeArguments>(RunPortableMode);
 
             var root = new RootCommand("A Stream Recorder For Bilibili Live")
@@ -48,9 +55,9 @@ namespace BililiveRecorder.Cli
             return root.Invoke(args);
         }
 
-        private static int RunConfigMode(string path)
+        private static int RunConfigMode(string path, LogEventLevel logLevel)
         {
-            var logger = BuildLogger();
+            using var logger = BuildLogger(logLevel);
             Log.Logger = logger;
 
             path = Path.GetFullPath(path);
@@ -85,7 +92,7 @@ namespace BililiveRecorder.Cli
 
         private static int RunPortableMode(PortableModeArguments opts)
         {
-            var logger = BuildLogger();
+            using var logger = BuildLogger(opts.LogLevel);
             Log.Logger = logger;
 
             var config = new ConfigV2()
@@ -93,26 +100,31 @@ namespace BililiveRecorder.Cli
                 DisableConfigSave = true,
             };
 
-            if (!string.IsNullOrWhiteSpace(opts.Cookie))
-                config.Global.Cookie = opts.Cookie;
-            if (!string.IsNullOrWhiteSpace(opts.LiveApiHost))
-                config.Global.LiveApiHost = opts.LiveApiHost;
-            if (!string.IsNullOrWhiteSpace(opts.WebhookUrl))
-                config.Global.WebHookUrlsV2 = opts.WebhookUrl;
-            if (!string.IsNullOrWhiteSpace(opts.FilenameFormat))
-                config.Global.RecordFilenameFormat = opts.FilenameFormat;
+            {
+                var global = config.Global;
 
-            config.Global.RecordDanmaku = true;
-            config.Global.RecordDanmakuGift = true;
-            config.Global.RecordDanmakuGuard = true;
-            config.Global.RecordDanmakuRaw = true;
-            config.Global.RecordDanmakuSuperChat = true;
-            config.Global.CuttingMode = CuttingMode.Disabled;
-            config.Global.RecordFilenameFormat = "{roomid}/{roomid}-{date}-{time}.flv";
+                if (!string.IsNullOrWhiteSpace(opts.Cookie))
+                    global.Cookie = opts.Cookie;
 
-            config.Global.WorkDirectory = opts.OutputPath;
-            config.Rooms = opts.RoomIds.Select(x => new RoomConfig { RoomId = x, AutoRecord = true }).ToList();
+                if (!string.IsNullOrWhiteSpace(opts.LiveApiHost))
+                    global.LiveApiHost = opts.LiveApiHost;
 
+                if (!string.IsNullOrWhiteSpace(opts.FilenameFormat))
+                    global.RecordFilenameFormat = opts.FilenameFormat;
+                
+                if (!string.IsNullOrWhiteSpace(opts.WebhookUrl))
+                    global.WebHookUrlsV2 = opts.WebhookUrl;
+
+                var danmaku = opts.Danmaku;
+                global.RecordDanmaku = danmaku != PortableModeArguments.PortableDanmakuMode.None;
+                global.RecordDanmakuSuperChat = danmaku.HasFlag(PortableModeArguments.PortableDanmakuMode.SuperChat);
+                global.RecordDanmakuGuard = danmaku.HasFlag(PortableModeArguments.PortableDanmakuMode.Guard);
+                global.RecordDanmakuGift = danmaku.HasFlag(PortableModeArguments.PortableDanmakuMode.Gift);
+                global.RecordDanmakuRaw = danmaku.HasFlag(PortableModeArguments.PortableDanmakuMode.RawData);
+
+                global.WorkDirectory = opts.OutputPath;
+                config.Rooms = opts.RoomIds.Select(x => new RoomConfig { RoomId = x, AutoRecord = true }).ToList();
+            }
             var serviceProvider = BuildServiceProvider(config, logger);
             var recorder = serviceProvider.GetRequiredService<IRecorder>();
 
@@ -140,18 +152,29 @@ namespace BililiveRecorder.Cli
             .AddRecorder()
             .BuildServiceProvider();
 
-        private static ILogger BuildLogger() => new LoggerConfiguration()
+        private static Logger BuildLogger(LogEventLevel logLevel) => new LoggerConfiguration()
             .MinimumLevel.Verbose()
             .Enrich.WithProcessId()
             .Enrich.WithThreadId()
             .Enrich.WithThreadName()
             .Enrich.FromLogContext()
             .Enrich.WithExceptionDetails()
-            .WriteTo.Console(restrictedToMinimumLevel: LogEventLevel.Verbose, outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] [{RoomId}] {Message:lj}{NewLine}{Exception}")
+            .Destructure.ByTransforming<Flv.Xml.XmlFlvFile.XmlFlvFileMeta>(x => new
+            {
+                x.Version,
+                x.ExportTime,
+                x.FileSize,
+                x.FileCreationTime,
+                x.FileModificationTime,
+            })
+            .WriteTo.Console(restrictedToMinimumLevel: logLevel, outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] [{RoomId}] {Message:lj}{NewLine}{Exception}")
+            .WriteTo.File(new CompactJsonFormatter(), "./logs/bilirec.txt", shared: true, rollingInterval: RollingInterval.Day, rollOnFileSizeLimit: true)
             .CreateLogger();
 
         public class PortableModeArguments
         {
+            public LogEventLevel LogLevel { get; set; } = LogEventLevel.Information;
+
             public string OutputPath { get; set; } = string.Empty;
 
             public string? Cookie { get; set; }
@@ -162,7 +185,21 @@ namespace BililiveRecorder.Cli
 
             public string? FilenameFormat { get; set; }
 
+            public PortableDanmakuMode Danmaku { get; set; }
+
             public IEnumerable<int> RoomIds { get; set; } = Enumerable.Empty<int>();
+
+            [Flags]
+            public enum PortableDanmakuMode
+            {
+                None = 0,
+                Danmaku = 1 << 0,
+                SuperChat = 1 << 1,
+                Guard = 1 << 2,
+                Gift = 1 << 3,
+                RawData = 1 << 4,
+                All = Danmaku | SuperChat | Guard | Gift | RawData
+            }
         }
     }
 }

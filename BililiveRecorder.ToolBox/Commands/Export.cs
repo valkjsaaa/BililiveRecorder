@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.IO.Pipelines;
+using System.Threading;
 using System.Threading.Tasks;
 using BililiveRecorder.Flv;
 using BililiveRecorder.Flv.Parser;
@@ -26,15 +27,25 @@ namespace BililiveRecorder.ToolBox.Commands
     {
         private static readonly ILogger logger = Log.ForContext<ExportHandler>();
 
-        public Task<CommandResponse<ExportResponse>> Handle(ExportRequest request) => this.Handle(request, null);
+        public Task<CommandResponse<ExportResponse>> Handle(ExportRequest request) => this.Handle(request, default, null);
 
-        public async Task<CommandResponse<ExportResponse>> Handle(ExportRequest request, Func<double, Task>? progress)
+        public async Task<CommandResponse<ExportResponse>> Handle(ExportRequest request, CancellationToken cancellationToken, Func<double, Task>? progress)
         {
             FileStream? inputStream = null, outputStream = null;
             try
             {
+                XmlFlvFile.XmlFlvFileMeta meta;
                 try
                 {
+                    var fi = new FileInfo(request.Input);
+                    meta = new XmlFlvFile.XmlFlvFileMeta
+                    {
+                        ExportTime = DateTimeOffset.Now,
+                        Version = GitVersionInformation.InformationalVersion,
+                        FileSize = fi.Length,
+                        FileCreationTime = fi.CreationTime,
+                        FileModificationTime = fi.LastWriteTime
+                    };
                     inputStream = File.Open(request.Input, FileMode.Open, FileAccess.Read, FileShare.Read);
                 }
                 catch (Exception ex)
@@ -67,9 +78,9 @@ namespace BililiveRecorder.ToolBox.Commands
                     var tags = new List<Tag>();
                     var memoryStreamProvider = new RecyclableMemoryStreamProvider();
                     using var reader = new FlvTagPipeReader(PipeReader.Create(inputStream), memoryStreamProvider, skipData: true, logger: logger);
-                    while (true)
+                    while (!cancellationToken.IsCancellationRequested)
                     {
-                        var tag = await reader.ReadTagAsync(default).ConfigureAwait(false);
+                        var tag = await reader.ReadTagAsync(cancellationToken).ConfigureAwait(false);
                         if (tag is null) break;
                         tags.Add(tag);
 
@@ -79,16 +90,24 @@ namespace BililiveRecorder.ToolBox.Commands
                     return tags;
                 });
 
+                if (cancellationToken.IsCancellationRequested)
+                    return new CommandResponse<ExportResponse> { Status = ResponseStatus.Cancelled };
+
                 await Task.Run(() =>
                 {
                     using var writer = new StreamWriter(new GZipStream(outputStream, CompressionLevel.Optimal));
                     XmlFlvFile.Serializer.Serialize(writer, new XmlFlvFile
                     {
-                        Tags = tags
+                        Tags = tags,
+                        Meta = meta
                     });
                 });
 
                 return new CommandResponse<ExportResponse> { Status = ResponseStatus.OK, Result = new ExportResponse() };
+            }
+            catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return new CommandResponse<ExportResponse> { Status = ResponseStatus.Cancelled };
             }
             catch (NotFlvFileException ex)
             {

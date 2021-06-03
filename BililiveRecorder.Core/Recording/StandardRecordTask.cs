@@ -64,7 +64,7 @@ namespace BililiveRecorder.Core.Recording
 
             this.targetProvider = new WriterTargetProvider(this, paths =>
             {
-                this.logger.ForContext(LoggingContext.RoomId, this.room.RoomConfig.RoomId).Debug("输出路径 {Path}", paths.fullPath);
+                this.logger.ForContext(LoggingContext.RoomId, this.room.RoomConfig.RoomId).Information("新建录制文件 {Path}", paths.fullPath);
 
                 var e = new RecordFileOpeningEventArgs(this.room)
                 {
@@ -215,13 +215,15 @@ namespace BililiveRecorder.Core.Recording
                     $"直播标题: {this.room.Title}\n" +
                     $"直播分区: {this.room.AreaNameParent}·{this.room.AreaNameChild}\n" +
                     $"录制时间: {now:O}\n" +
+                    $"服务器: {this.streamHost}\n" +
                     $"\n" +
                     $"使用 B站录播姬 录制 https://rec.danmuji.org\n" +
                     $"录播姬版本: {GitVersionInformation.FullSemVer}");
                 value["BililiveRecorder"] = new ScriptDataEcmaArray
                 {
                     ["RecordedBy"] = (ScriptDataString)"BililiveRecorder B站录播姬",
-                    ["RecorderVersion"] = (ScriptDataString)GitVersionInformation.FullSemVer,
+                    ["RecordedFrom"] = (ScriptDataString)(this.streamHost ?? string.Empty),
+                    ["RecorderVersion"] = (ScriptDataString)GitVersionInformation.InformationalVersion,
                     ["StartTime"] = (ScriptDataDate)now,
                     ["RoomId"] = (ScriptDataString)this.room.RoomConfig.RoomId.ToString(),
                     ["ShortId"] = (ScriptDataString)this.room.ShortId.ToString(),
@@ -263,7 +265,7 @@ namespace BililiveRecorder.Core.Recording
                 this.OnNewFile = onNewFile ?? throw new ArgumentNullException(nameof(onNewFile));
             }
 
-            public (Stream stream, object state) CreateOutputStream()
+            public (Stream stream, object? state) CreateOutputStream()
             {
                 var paths = this.task.CreateFileName();
 
@@ -288,7 +290,7 @@ namespace BililiveRecorder.Core.Recording
                 { Directory.CreateDirectory(Path.GetDirectoryName(path)); }
                 catch (Exception) { }
 
-                var stream = new FileStream(path, FileMode.Append, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
                 return stream;
             }
         }

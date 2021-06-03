@@ -29,6 +29,7 @@ namespace BililiveRecorder.Core.Recording
         protected readonly ILogger logger;
         protected readonly IApiClient apiClient;
 
+        protected string? streamHost;
         protected bool started = false;
         protected bool timeoutTriggered = false;
 
@@ -78,7 +79,8 @@ namespace BililiveRecorder.Core.Recording
 
             var fullUrl = await this.FetchStreamUrlAsync(this.room.RoomConfig.RoomId).ConfigureAwait(false);
 
-            this.logger.Information("连接直播服务器 {Host}", new Uri(fullUrl).Host);
+            this.streamHost = new Uri(fullUrl).Host;
+            this.logger.Information("连接直播服务器 {Host}", this.streamHost);
             this.logger.Debug("直播流地址 {Url}", fullUrl);
 
             var stream = await this.GetStreamAsync(fullUrl: fullUrl, timeout: (int)this.room.RoomConfig.TimingStreamConnect).ConfigureAwait(false);
@@ -255,7 +257,12 @@ namespace BililiveRecorder.Core.Recording
             if (url_infos is null || url_infos.Length == 0)
                 throw new Exception("no url_info");
 
-            var url_info = url_infos[this.random.Next(url_infos.Length)];
+            // https:// xy0x0x0x0xy.mcdn.bilivideo.cn:486
+            var url_infos_without_mcdn = url_infos.Where(x => !x.Host.Contains(".mcdn.")).ToArray();
+
+            var url_info = url_infos_without_mcdn.Length != 0
+                ? url_infos_without_mcdn[this.random.Next(url_infos_without_mcdn.Length)]
+                : url_infos[this.random.Next(url_infos.Length)];
 
             var fullUrl = url_info.Host + url_http_stream_flv_avc.BaseUrl + url_info.Extra;
             return fullUrl;
